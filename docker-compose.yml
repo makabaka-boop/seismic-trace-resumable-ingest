@@ -1,0 +1,65 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-seis}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-seis}
+      POSTGRES_DB: ${POSTGRES_DB:-seis}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-seis} -d ${POSTGRES_DB:-seis}"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-seis}:${POSTGRES_PASSWORD:-seis}@db:5432/${POSTGRES_DB:-seis}
+    ports:
+      # Host-side port can be overridden: API_PORT=9000 docker compose up
+      - "${API_PORT:-8000}:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health').status==200 else 1)"
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  # One-shot acceptance service: `docker compose --profile verify run --rm verify`
+  verify:
+    profiles: ["verify"]
+    build:
+      context: .
+      dockerfile: Dockerfile.verify
+      args:
+        # docker CLI static build is downloaded for restart-persistence tests
+        DOCKER_VERSION: "27.4.1"
+    environment:
+      API_BASE_URL: http://api:8000
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-seis}:${POSTGRES_PASSWORD:-seis}@db:5432/${POSTGRES_DB:-seis}
+      DATABASE_DSN: postgresql://${POSTGRES_USER:-seis}:${POSTGRES_PASSWORD:-seis}@db:5432/${POSTGRES_DB:-seis}
+      RESTART_COMPOSE_SERVICE: api
+    volumes:
+      # Read-only socket lets the suite kill/restart the API container to
+      # prove checkpoint + chunk persistence across a real process restart.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      api:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+    restart: "no"
+
+volumes:
+  pgdata:

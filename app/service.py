@@ -1,0 +1,410 @@
+"""Upload protocol state machine.
+
+Rules implemented here (see README for the full protocol):
+
+* A session is created with an immutable ``total_bytes`` + ``whole_sha256``.
+* Chunks are binary, described by ``start`` offset, declared ``length`` and
+  the chunk's own SHA-256.  A new chunk must begin exactly at
+  ``confirmed_offset`` and must not cross ``total_bytes``.
+* Retransmission of any range already inside ``[0, confirmed_offset)`` whose
+  bytes are byte-identical to the archived bytes succeeds idempotently;
+  every other stale offset is answered with the current expected offset.
+* When ``confirmed_offset == total_bytes`` the package is reassembled from
+  persisted chunks and its whole SHA-256 is recomputed.  A match seals the
+  session (immutable); a mismatch puts it into the terminal ``failed`` state
+  which can never be resumed — a new session with correct metadata is needed.
+"""
+from __future__ import annotations
+
+import hashlib
+import uuid
+
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+from .errors import UploadError
+from .models import ACTIVE, FAILED, SEALED, Chunk, UploadSession
+
+EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
+
+
+# --------------------------------------------------------------------------- #
+# Session creation / lookup
+# --------------------------------------------------------------------------- #
+def create_session(db: Session, total_bytes: int, whole_sha256: str) -> UploadSession:
+    session = UploadSession(
+        id=str(uuid.uuid4()),
+        total_bytes=total_bytes,
+        whole_sha256=whole_sha256,
+        confirmed_offset=0,
+        status=ACTIVE,
+    )
+    db.add(session)
+
+    # A zero-length package is complete the moment it is registered:
+    # seal it when its metadata is correct, fail it terminally otherwise.
+    if total_bytes == 0:
+        if whole_sha256 == EMPTY_SHA256:
+            session.status = SEALED
+            session.confirmed_offset = 0
+            session.computed_sha256 = EMPTY_SHA256
+        else:
+            session.status = FAILED
+            session.computed_sha256 = EMPTY_SHA256
+            session.failure_reason = (
+                "zero-length package metadata inconsistent: "
+                "whole_sha256 does not match SHA-256 of empty payload"
+            )
+            db.commit()
+            raise UploadError(
+                422,
+                "whole_digest_mismatch",
+                "session failed terminally: declared whole_sha256 does not match "
+                "the only possible digest of a 0-byte package; create a new session",
+                digest=whole_sha256,
+                expected_digest=EMPTY_SHA256,
+            )
+
+    db.commit()
+    db.refresh(session)
+    return session
+
+
+def _get_locked_session(db: Session, session_id: str) -> UploadSession:
+    """Fetch a session with a row lock, serialising chunk PUTs per session."""
+    session = db.get(
+        UploadSession,
+        session_id,
+        with_for_update={"nowait": False},
+    )
+    if session is None:
+        raise UploadError(
+            404, "session_not_found", f"unknown session id: {session_id}"
+        )
+    return session
+
+
+# --------------------------------------------------------------------------- #
+# Chunk handling
+# --------------------------------------------------------------------------- #
+def _chunks_in_range(
+    db: Session, session_id: str, begin: int, end: int
+) -> list[Chunk]:
+    """Return stored chunks overlapping [begin, end), ordered by offset."""
+    stmt = (
+        select(Chunk)
+        .where(
+            Chunk.session_id == session_id,
+            Chunk.start_offset < end,
+            Chunk.end_offset > begin,
+        )
+        .order_by(Chunk.start_offset)
+    )
+    return list(db.execute(stmt).scalars().all())
+
+
+def _archived_bytes(
+    db: Session, session_id: str, begin: int, end: int
+) -> bytes | None:
+    """Concatenate archived chunk bytes for [begin, end).
+
+    Returns ``None`` if the archived chunks do not cover the range without
+    gaps (with our append-only layout this can only happen if the caller asks
+    for bytes beyond ``confirmed_offset``).
+    """
+    if begin == end:
+        return b""
+    chunks = _chunks_in_range(db, session_id, begin, end)
+    out = bytearray()
+    cursor = begin
+    for chunk in chunks:
+        if chunk.start_offset > cursor:
+            return None  # gap
+        overlap_end = min(chunk.end_offset, end)
+        rel_start = cursor - chunk.start_offset
+        out.extend(chunk.data[rel_start : overlap_end - chunk.start_offset])
+        cursor = overlap_end
+        if cursor >= end:
+            break
+    return bytes(out) if cursor == end else None
+
+
+def _stale_offset_error(session: UploadSession, start: int) -> UploadError:
+    return UploadError(
+        409,
+        "stale_offset",
+        (
+            f"stale or non-contiguous chunk at offset {start}: the next chunk "
+            f"must start at confirmed_offset {session.confirmed_offset}"
+        ),
+        offset=start,
+        expected_offset=session.confirmed_offset,
+    )
+
+
+def _terminal_replay(
+    session: UploadSession,
+    start: int,
+    length: int,
+    chunk_digest: str,
+    payload: bytes,
+    db: Session,
+) -> dict:
+    """Idempotency rules that still apply once a session is sealed/failed."""
+    end = start + length
+    # Only a full retransmission of an already archived range may be echoed.
+    if (
+        0 <= start < end <= session.confirmed_offset
+        and session.confirmed_offset == session.total_bytes
+    ):
+        archived = _archived_bytes(db, session.id, start, end)
+        if archived is not None and archived == payload:
+            return _ack(
+                session, start, length, chunk_digest, idempotent_replay=True
+            )
+    if session.status == FAILED:
+        raise UploadError(
+            409,
+            "session_failed_terminal",
+            (
+                "session is in the terminal 'failed' state because the whole "
+                "package digest did not match; it cannot be resumed — create a "
+                "new session with correct total_bytes/whole_sha256 metadata"
+            ),
+            expected_offset=session.confirmed_offset,
+            expected_digest=session.whole_sha256,
+            details={"computed_sha256": session.computed_sha256},
+        )
+    # sealed + different content / bad offset
+    if start + length <= session.confirmed_offset:
+        raise UploadError(
+            409,
+            "sealed_content_conflict",
+            (
+                f"sealed archive is immutable: bytes retransmitted at offset "
+                f"{start} differ from the sealed content"
+            ),
+            offset=start,
+            expected_offset=session.total_bytes,
+        )
+    raise UploadError(
+        409,
+        "session_sealed",
+        f"session is already sealed at offset {session.total_bytes}",
+        offset=start,
+        expected_offset=session.total_bytes,
+    )
+
+
+# ---- HTTP-facing ack -------------------------------------------------------
+def _ack(
+    session: UploadSession,
+    start: int,
+    length: int,
+    chunk_digest: str,
+    *,
+    idempotent_replay: bool,
+) -> dict:
+    return {
+        "id": session.id,
+        "status": session.status,
+        "start_offset": start,
+        "length": length,
+        "chunk_sha256": chunk_digest,
+        "confirmed_offset": session.confirmed_offset,
+        "expected_offset": session.confirmed_offset
+        if session.status == ACTIVE
+        else session.total_bytes,
+        "total_bytes": session.total_bytes,
+        "idempotent_replay": idempotent_replay,
+    }
+
+
+def _verify_and_finalize(db: Session, session: UploadSession) -> None:
+    """Recompute the whole-package hash once every byte has arrived."""
+    total = session.total_bytes
+    chunks = list(
+        db.execute(
+            select(Chunk)
+            .where(Chunk.session_id == session.id)
+            .order_by(Chunk.start_offset)
+        ).scalars().all()
+    )
+
+    hasher = hashlib.sha256()
+    cursor = 0
+    for chunk in chunks:
+        if chunk.start_offset != cursor:
+            # Persisted bytes are discontinuous: the package cannot match.
+            computed = None
+            break
+        hasher.update(chunk.data)
+        cursor = chunk.end_offset
+    else:
+        computed = hasher.hexdigest() if cursor == total else None
+
+    if computed is not None and computed == session.whole_sha256:
+        session.status = SEALED
+        session.confirmed_offset = total
+        session.computed_sha256 = computed
+        session.failure_reason = None
+        return
+
+    session.status = FAILED
+    session.computed_sha256 = computed
+    session.failure_reason = (
+        "whole package SHA-256 mismatch after all bytes were received"
+        if computed is not None
+        else "stored chunks are discontinuous or incomplete at finalization"
+    )
+
+
+def put_chunk(
+    db: Session,
+    session_id: str,
+    start: int,
+    declared_length: int,
+    chunk_digest: str,
+    payload: bytes,
+) -> dict:
+    session = _get_locked_session(db, session_id)
+    end = start + declared_length
+
+    # ---- structural validation (errors always cite offset / digest) -------
+    if start < 0:
+        raise UploadError(
+            422, "invalid_offset", "start offset must be >= 0", offset=start
+        )
+    if declared_length < 0:
+        raise UploadError(
+            422,
+            "invalid_length",
+            "declared length must be >= 0",
+            offset=start,
+            details={"length": declared_length},
+        )
+    if len(payload) != declared_length:
+        raise UploadError(
+            422,
+            "length_mismatch",
+            (
+                f"declared length {declared_length} does not match the "
+                f"{len(payload)} received body bytes"
+            ),
+            offset=start,
+            details={"declared_length": declared_length, "actual_length": len(payload)},
+        )
+    actual_digest = hashlib.sha256(payload).hexdigest()
+    if actual_digest != chunk_digest:
+        raise UploadError(
+            400,
+            "chunk_digest_mismatch",
+            (
+                f"chunk at offset {start} fails its own SHA-256 check: "
+                f"declared {chunk_digest}, recomputed {actual_digest}"
+            ),
+            offset=start,
+            digest=chunk_digest,
+            expected_digest=actual_digest,
+        )
+    if end > session.total_bytes:
+        raise UploadError(
+            416,
+            "chunk_beyond_total",
+            (
+                f"chunk [{start}, {end}) crosses total_bytes "
+                f"{session.total_bytes}"
+            ),
+            offset=start,
+            expected_offset=session.confirmed_offset,
+            details={"end": end, "total_bytes": session.total_bytes},
+        )
+
+    # ---- terminal states only honour byte-identical replays --------------
+    if session.status in (SEALED, FAILED):
+        ack = _terminal_replay(
+            session, start, declared_length, chunk_digest, payload, db
+        )
+        db.commit()
+        return ack
+
+    # ---- active session ---------------------------------------------------
+    confirmed = session.confirmed_offset
+
+    if start == confirmed and end > confirmed:
+        # The expected forward chunk.
+        chunk = Chunk(
+            session_id=session.id,
+            start_offset=start,
+            end_offset=end,
+            length=declared_length,
+            sha256=chunk_digest,
+            data=payload,
+        )
+        db.add(chunk)
+        try:
+            db.flush()
+        except IntegrityError:
+            db.rollback()
+            # Concurrent duplicate insert: fall back to idempotent semantics.
+            session = _get_locked_session(db, session_id)
+            archived = _archived_bytes(db, session_id, start, end)
+            if archived == payload:
+                return _ack(session, start, declared_length, chunk_digest,
+                            idempotent_replay=True)
+            raise _stale_offset_error(session, start)
+
+        session.confirmed_offset = end
+        finalized = False
+        if end == session.total_bytes:
+            _verify_and_finalize(db, session)
+            finalized = True
+        db.commit()
+        db.refresh(session)
+        ack = _ack(session, start, declared_length, chunk_digest,
+                   idempotent_replay=False)
+        if finalized and session.status == FAILED:
+            # Surface the terminal failure at the upload that caused it.
+            raise UploadError(
+                422,
+                "whole_digest_mismatch",
+                (
+                    "all bytes received but recomputed whole package SHA-256 "
+                    f"{session.computed_sha256} does not match declared "
+                    f"{session.whole_sha256}; session is terminally failed, "
+                    "create a new session with correct metadata"
+                ),
+                offset=session.total_bytes,
+                digest=session.whole_sha256,
+                expected_digest=session.computed_sha256,
+            )
+        return ack
+
+    if start == confirmed and end == confirmed:
+        # Zero-length chunk at the frontier: a harmless idempotent no-op
+        # (empty payload already passed its digest check).
+        db.commit()
+        return _ack(session, start, 0, chunk_digest, idempotent_replay=True)
+
+    # ---- stale offsets ----------------------------------------------------
+    if end <= confirmed:
+        # Fully inside the confirmed range: succeed only when bytes are
+        # identical to what is already archived, regardless of how the
+        # retransmission is re-chunked.
+        archived = _archived_bytes(db, session_id, start, end)
+        if archived is not None and archived == payload:
+            db.commit()
+            return _ack(
+                session, start, declared_length, chunk_digest,
+                idempotent_replay=True,
+            )
+        raise _stale_offset_error(session, start)
+
+    # Overlaps the frontier but doesn't start at it, or starts ahead of it.
+    raise _stale_offset_error(session, start)
+
+
+def sealed_payload(db: Session, session: UploadSession) -> bytes:
+    """Materialise the archived package; only used for the download route."""
+    return _archived_bytes(db, session.id, 0, session.total_bytes) or b""
