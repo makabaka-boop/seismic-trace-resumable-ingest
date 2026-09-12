@@ -27,7 +27,10 @@ RUN apt-get update \
     && chmod +x /usr/local/bin/docker \
     && rm -rf /tmp/docker /tmp/docker.tgz /var/lib/apt/lists/*
 
-COPY requirements-verify.txt ./
+# Copy BOTH manifests: requirements-verify.txt starts with
+# "-r requirements.txt", so the primary list must be present or pip fails
+# with "Could not open requirements file: requirements.txt".
+COPY requirements.txt requirements-verify.txt ./
 RUN pip install --no-cache-dir -r requirements-verify.txt
 
 COPY tests ./tests
