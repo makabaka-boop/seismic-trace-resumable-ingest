@@ -435,6 +435,18 @@ def compact_sealed(
     length and whole-package digest are re-verified before commit.  Any
     verification failure rolls the whole rewrite back.
     """
+    # Reject non-integer targets outright instead of coercing them; bool is
+    # an int subclass in Python, so it must be excluded explicitly (a bare
+    # ``True`` would otherwise execute as a 1-byte target).
+    if isinstance(target_chunk_bytes, bool) or not isinstance(
+        target_chunk_bytes, int
+    ):
+        raise UploadError(
+            422,
+            "invalid_target_chunk_bytes",
+            "target_chunk_bytes must be a positive integer",
+            details={"target_chunk_bytes": target_chunk_bytes},
+        )
     if target_chunk_bytes <= 0:
         raise UploadError(
             422,

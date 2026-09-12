@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, StrictInt, field_validator
 
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -53,9 +53,13 @@ class ChunkAck(BaseModel):
 
 
 class CompactRequest(BaseModel):
-    """Target maximum chunk size in bytes for a sealed-package compaction."""
+    """Target maximum chunk size in bytes for a sealed-package compaction.
 
-    target_chunk_bytes: int = Field(
+    Strictly typed: numeric strings, floats and booleans are rejected with
+    a 422 parameter error instead of being silently coerced to an int.
+    """
+
+    target_chunk_bytes: StrictInt = Field(
         ..., gt=0, description="New chunks must not exceed this many bytes"
     )
 
