@@ -113,6 +113,15 @@ class Client:
             f"{self.base}/sessions/{session_id}/content", timeout=30
         )
 
+    def compact(
+        self, session_id: str, target_chunk_bytes: int | str
+    ) -> requests.Response:
+        return requests.post(
+            f"{self.base}/sessions/{session_id}/compact",
+            json={"target_chunk_bytes": target_chunk_bytes},
+            timeout=60,
+        )
+
 
 @pytest.fixture
 def client() -> Client:

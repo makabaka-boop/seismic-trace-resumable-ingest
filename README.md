@@ -97,6 +97,31 @@ Content-Type: application/octet-stream
 - `GET /sessions/{id}/content` — 仅 `sealed` 可下载；响应头 `ETag`/
   `X-Whole-SHA256` 为登记摘要，且服务端出库时再次校验。
 
+### 4. 压实封存记录
+
+```
+POST /sessions/{id}/compact
+{"target_chunk_bytes": 4096}
+→ 200 {"id", "status": "sealed", "target_chunk_bytes",
+       "chunks_before", "chunks_after",
+       "total_bytes_before", "total_bytes_after",
+       "whole_sha256", "chunks": [{"start_offset","end_offset","length","sha256"}, ...]}
+```
+
+封存后在**会话行锁保护的单个事务**中按偏移顺序读出既有字节，重排为长度不超过
+`target_chunk_bytes` 的连续分块并重算每块摘要；提交前再次核对总长度与整包
+SHA-256，任一不符则完整回滚。整包身份（`id`、总字节数、整包摘要）不变，
+压实仅改变分块边界：分块数与总字节数的前后值及新布局随响应返回。
+
+- 同一目标重复压实是确定性、幂等的：得到相同布局与块摘要（已是目标布局时
+  不写任何行，`chunks_before == chunks_after`）；
+- 仅 `sealed` 会话可压实；`active`/`failed` 返回
+  `409 compaction_state_conflict`（`location.expected_offset` 与
+  `details.status` 定位会话状态），且无任何副作用；
+- `target_chunk_bytes` 非正整数 / 非整数返回 `422 validation_error`；
+- 压实期间其他查询只能看到压实前或压实后的完整布局（单事务提交）；
+- 创建、上传、分块查询与内容下载契约保持兼容。
+
 ## 示例（curl）
 
 ```bash
@@ -123,3 +148,7 @@ dd if=pkg.bin bs=4096 count=1 2>/dev/null | curl -s -X PUT --data-binary @- \
 - 每个分块 PUT 在事务内对会话行 `SELECT ... FOR UPDATE` 加锁，同会话并发写入按序
   提交；败者收到带期望偏移的 `409` 后按协议重试即可；
 - 封存时按偏移顺序流式喂给 hasher 重算整包摘要（不在内存里拼装整包）。
+- 压实同样在会话行锁保护的**单个事务**内完成：按偏移读出旧字节→重排为不超过
+  `target_chunk_bytes` 的连续分块并重算块摘要→删除旧行、插入新行→提交前再次核对
+  连续性、总长度与整包摘要；任一不符完整回滚。读已提交隔离下，压实进行中的外部
+  查询只能看到压实前或压实后的完整布局。

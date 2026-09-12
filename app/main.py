@@ -18,7 +18,13 @@ from .config import MAX_CHUNK_BYTES
 from .database import get_db, init_db
 from .errors import UploadError
 from .models import SEALED, Chunk, UploadSession
-from .schemas import ChunkAck, SessionCreate, SessionResponse
+from .schemas import (
+    ChunkAck,
+    CompactRequest,
+    CompactResponse,
+    SessionCreate,
+    SessionResponse,
+)
 
 SHA256_QUERY_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 
@@ -284,3 +290,26 @@ def download_content(
             "X-Whole-SHA256": session.whole_sha256,
         },
     )
+
+
+# --------------------------------------------------------------------------- #
+# Sealed archive compaction
+# --------------------------------------------------------------------------- #
+@app.post(
+    "/sessions/{session_id}/compact",
+    response_model=CompactResponse,
+)
+def compact_session(
+    session_id: str,
+    payload: CompactRequest,
+    db: Session = Depends(get_db),
+) -> CompactResponse:
+    """Repack a sealed session into contiguous chunks no larger than target.
+
+    The package identity (id, total bytes, whole SHA-256) never changes;
+    only the chunk layout is rewritten, deterministically for a given target.
+    """
+    result = service.compact_sealed(
+        db, session_id=session_id, target_chunk_bytes=payload.target_chunk_bytes
+    )
+    return CompactResponse(**result)

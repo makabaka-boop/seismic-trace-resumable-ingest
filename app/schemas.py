@@ -50,3 +50,36 @@ class ChunkAck(BaseModel):
     expected_offset: int
     total_bytes: int
     idempotent_replay: bool = False
+
+
+class CompactRequest(BaseModel):
+    """Target maximum chunk size in bytes for a sealed-package compaction."""
+
+    target_chunk_bytes: int = Field(
+        ..., gt=0, description="New chunks must not exceed this many bytes"
+    )
+
+
+class ChunkInfo(BaseModel):
+    start_offset: int
+    end_offset: int
+    length: int
+    sha256: str
+
+
+class CompactResponse(BaseModel):
+    """Before/after layout of a successful compaction.
+
+    The package identity (session id, total length, whole SHA-256) is
+    unchanged; only the chunk boundary layout is rewritten.
+    """
+
+    id: str
+    status: Literal["sealed"]
+    target_chunk_bytes: int
+    chunks_before: int
+    chunks_after: int
+    total_bytes_before: int
+    total_bytes_after: int
+    whole_sha256: str
+    chunks: list[ChunkInfo]

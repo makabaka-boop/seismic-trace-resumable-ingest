@@ -408,3 +408,259 @@ def put_chunk(
 def sealed_payload(db: Session, session: UploadSession) -> bytes:
     """Materialise the archived package; only used for the download route."""
     return _archived_bytes(db, session.id, 0, session.total_bytes) or b""
+
+
+# --------------------------------------------------------------------------- #
+# Sealed archive compaction
+# --------------------------------------------------------------------------- #
+def _planned_spans(total: int, target_chunk_bytes: int) -> list[tuple[int, int]]:
+    """Deterministic target layout: contiguous spans of <= target size.
+
+    Splitting purely on (total, target) makes repeated compaction with the
+    same target byte-for-byte identical in layout and chunk digests.
+    """
+    return [
+        (off, min(off + target_chunk_bytes, total))
+        for off in range(0, total, target_chunk_bytes)
+    ]
+
+
+def compact_sealed(
+    db: Session, session_id: str, target_chunk_bytes: int
+) -> dict:
+    """Rewrite a sealed package's chunks into <= target_chunk_bytes spans.
+
+    Runs under the session row lock inside a single transaction.  Existing
+    bytes are read in offset order, re-chunked and re-hashed; the total
+    length and whole-package digest are re-verified before commit.  Any
+    verification failure rolls the whole rewrite back.
+    """
+    if target_chunk_bytes <= 0:
+        raise UploadError(
+            422,
+            "invalid_target_chunk_bytes",
+            "target_chunk_bytes must be a positive integer",
+            details={"target_chunk_bytes": target_chunk_bytes},
+        )
+
+    session = _get_locked_session(db, session_id)
+    if session.status != SEALED:
+        raise UploadError(
+            409,
+            "compaction_state_conflict",
+            (
+                "only sealed sessions can be compacted "
+                f"(state={session.status})"
+            ),
+            expected_offset=session.confirmed_offset,
+            details={"status": session.status},
+        )
+
+    total = session.total_bytes
+    try:
+        old_chunks = list(
+            db.execute(
+                select(Chunk)
+                .where(Chunk.session_id == session_id)
+                .order_by(Chunk.start_offset)
+            ).scalars().all()
+        )
+
+        # Read the archived bytes in offset order while simultaneously
+        # verifying continuity, length and the whole-package digest.
+        hasher = hashlib.sha256()
+        buffer = bytearray()
+        cursor = 0
+        for chunk in old_chunks:
+            if chunk.start_offset != cursor:
+                raise UploadError(
+                    500,
+                    "compaction_integrity_error",
+                    (
+                        "stored chunks are discontinuous at offset "
+                        f"{cursor}; refusing to compact"
+                    ),
+                    expected_offset=cursor,
+                )
+            buffer.extend(chunk.data)
+            hasher.update(chunk.data)
+            cursor = chunk.end_offset
+
+        if cursor != total or len(buffer) != total:
+            raise UploadError(
+                500,
+                "compaction_integrity_error",
+                (
+                    f"archived length {cursor} does not match registered "
+                    f"total_bytes {total}; refusing to compact"
+                ),
+                offset=cursor,
+                expected_offset=total,
+            )
+        whole_digest = hasher.hexdigest()
+        if whole_digest != session.whole_sha256:
+            raise UploadError(
+                500,
+                "compaction_integrity_error",
+                (
+                    "archived bytes recompute to a different whole digest; "
+                    "refusing to compact"
+                ),
+                digest=session.whole_sha256,
+                expected_digest=whole_digest,
+            )
+
+        chunks_before = len(old_chunks)
+        total_bytes_before = sum(c.length for c in old_chunks)
+
+        plan = _planned_spans(total, target_chunk_bytes)
+
+        # Idempotent no-op: the persisted layout already equals the target
+        # layout, so leave rows (and their digests) untouched.
+        old_layout = [
+            (c.start_offset, c.end_offset, c.length, c.sha256) for c in old_chunks
+        ]
+        new_layout = [
+            (
+                off,
+                end,
+                end - off,
+                hashlib.sha256(bytes(buffer[off:end])).hexdigest(),
+            )
+            for off, end in plan
+        ]
+        if old_layout == new_layout:
+            # Nothing to rewrite: end the locked read transaction cleanly.
+            db.commit()
+            return _compact_result(
+                session, target_chunk_bytes, chunks_before, len(new_layout),
+                total_bytes_before, total, whole_digest, new_layout,
+            )
+
+        # Single-commit rewrite: delete old rows, insert the new spans.
+        for chunk in old_chunks:
+            db.delete(chunk)
+        db.flush()
+        new_rows: list[Chunk] = []
+        for off, end, length, digest in new_layout:
+            row = Chunk(
+                session_id=session_id,
+                start_offset=off,
+                end_offset=end,
+                length=length,
+                sha256=digest,
+                data=bytes(buffer[off:end]),
+            )
+            db.add(row)
+            new_rows.append(row)
+        db.flush()
+
+        # Re-verify the freshly persisted layout before committing.
+        verify_chunks = list(
+            db.execute(
+                select(Chunk)
+                .where(Chunk.session_id == session_id)
+                .order_by(Chunk.start_offset)
+            ).scalars().all()
+        )
+        verifier = hashlib.sha256()
+        verify_cursor = 0
+        total_bytes_after = 0
+        for chunk in verify_chunks:
+            if chunk.start_offset != verify_cursor:
+                raise UploadError(
+                    500,
+                    "compaction_integrity_error",
+                    "new layout is discontinuous; rolling back",
+                    expected_offset=verify_cursor,
+                )
+            if chunk.length > target_chunk_bytes:
+                raise UploadError(
+                    500,
+                    "compaction_integrity_error",
+                    (
+                        f"new chunk at offset {chunk.start_offset} exceeds "
+                        f"target size {target_chunk_bytes}"
+                    ),
+                    offset=chunk.start_offset,
+                    details={"length": chunk.length},
+                )
+            if hashlib.sha256(chunk.data).hexdigest() != chunk.sha256:
+                raise UploadError(
+                    500,
+                    "compaction_integrity_error",
+                    f"new chunk at offset {chunk.start_offset} fails its digest",
+                    offset=chunk.start_offset,
+                    expected_digest=chunk.sha256,
+                )
+            verifier.update(chunk.data)
+            verify_cursor = chunk.end_offset
+            total_bytes_after += chunk.length
+
+        if verify_cursor != total:
+            raise UploadError(
+                500,
+                "compaction_integrity_error",
+                (
+                    f"new layout length {verify_cursor} does not match "
+                    f"total_bytes {total}"
+                ),
+                offset=verify_cursor,
+                expected_offset=total,
+            )
+        recomputed_whole = verifier.hexdigest()
+        if recomputed_whole != session.whole_sha256:
+            raise UploadError(
+                500,
+                "compaction_integrity_error",
+                "new layout fails whole-digest verification; rolling back",
+                digest=session.whole_sha256,
+                expected_digest=recomputed_whole,
+            )
+
+        db.commit()
+        return _compact_result(
+            session, target_chunk_bytes, chunks_before, len(verify_chunks),
+            total_bytes_before, total_bytes_after, recomputed_whole,
+            [
+                (c.start_offset, c.end_offset, c.length, c.sha256)
+                for c in verify_chunks
+            ],
+        )
+    except UploadError:
+        db.rollback()
+        raise
+    except Exception:
+        db.rollback()
+        raise
+
+
+def _compact_result(
+    session: UploadSession,
+    target_chunk_bytes: int,
+    chunks_before: int,
+    chunks_after: int,
+    total_bytes_before: int,
+    total_bytes_after: int,
+    whole_sha256: str,
+    layout: list[tuple[int, int, int, str]],
+) -> dict:
+    return {
+        "id": session.id,
+        "status": SEALED,
+        "target_chunk_bytes": target_chunk_bytes,
+        "chunks_before": chunks_before,
+        "chunks_after": chunks_after,
+        "total_bytes_before": total_bytes_before,
+        "total_bytes_after": total_bytes_after,
+        "whole_sha256": whole_sha256,
+        "chunks": [
+            {
+                "start_offset": off,
+                "end_offset": end,
+                "length": length,
+                "sha256": digest,
+            }
+            for off, end, length, digest in layout
+        ],
+    }
