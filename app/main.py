@@ -19,6 +19,7 @@ from .database import get_db, init_db
 from .errors import UploadError
 from .models import SEALED, Chunk, UploadSession
 from .schemas import (
+    AuditTrailResponse,
     ChunkAck,
     CompactRequest,
     CompactResponse,
@@ -173,6 +174,23 @@ def list_chunks(session_id: str, db: Session = Depends(get_db)) -> dict:
             for r in rows
         ],
     }
+
+
+# --------------------------------------------------------------------------- #
+# Archive audit trail — read-only snapshot history of a session
+# --------------------------------------------------------------------------- #
+@app.get("/sessions/{session_id}/audit", response_model=AuditTrailResponse)
+def get_audit_trail(
+    session_id: str, db: Session = Depends(get_db)
+) -> AuditTrailResponse:
+    """Return seal/compaction snapshots in event order.
+
+    The upload session lifecycle is not touched.  An unknown session yields
+    the usual ``session_not_found`` 404; active/failed sessions and sessions
+    sealed before auditing existed return an empty ``events`` list.
+    """
+    events = service.get_audit_trail(db, session_id=session_id)
+    return AuditTrailResponse(id=session_id, events=events)
 
 
 # --------------------------------------------------------------------------- #

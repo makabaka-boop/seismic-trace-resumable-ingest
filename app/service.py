@@ -19,12 +19,21 @@ from __future__ import annotations
 import hashlib
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .errors import UploadError
-from .models import ACTIVE, FAILED, SEALED, Chunk, UploadSession
+from .models import (
+    ACTIVE,
+    AUDIT_COMPACTED,
+    AUDIT_SEALED,
+    FAILED,
+    SEALED,
+    AuditEvent,
+    Chunk,
+    UploadSession,
+)
 
 EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 
@@ -49,6 +58,15 @@ def create_session(db: Session, total_bytes: int, whole_sha256: str) -> UploadSe
             session.status = SEALED
             session.confirmed_offset = 0
             session.computed_sha256 = EMPTY_SHA256
+            # Born-sealed: the first audit snapshot is part of the same
+            # transaction that creates the session.
+            _add_audit(
+                db,
+                session,
+                AUDIT_SEALED,
+                total_bytes=0,
+                whole_sha256=EMPTY_SHA256,
+            )
         else:
             session.status = FAILED
             session.computed_sha256 = EMPTY_SHA256
@@ -221,6 +239,59 @@ def _ack(
     }
 
 
+def _next_audit_sequence(db: Session, session_id: str) -> int:
+    """Next per-session ordinal; callers already hold the session row lock."""
+    current = db.execute(
+        select(func.coalesce(func.max(AuditEvent.sequence), 0)).where(
+            AuditEvent.session_id == session_id
+        )
+    ).scalar_one()
+    return int(current) + 1
+
+
+def _add_audit(
+    db: Session,
+    session: UploadSession,
+    event: str,
+    *,
+    total_bytes: int,
+    whole_sha256: str,
+    target_chunk_bytes: int | None = None,
+    chunks_before: int | None = None,
+    chunks_after: int | None = None,
+) -> AuditEvent:
+    """Append an audit snapshot inside the caller's open transaction.
+
+    Nothing is committed here: when the surrounding seal/compaction
+    transaction rolls back, the audit row disappears with it, so a failed
+    operation can never leave an orphan record.
+    """
+    row = AuditEvent(
+        session_id=session.id,
+        sequence=_next_audit_sequence(db, session.id),
+        event=event,
+        total_bytes=total_bytes,
+        whole_sha256=whole_sha256,
+        target_chunk_bytes=target_chunk_bytes,
+        chunks_before=chunks_before,
+        chunks_after=chunks_after,
+    )
+    db.add(row)
+    try:
+        db.flush()
+    except Exception:
+        # The audit write shares the seal/compaction transaction: signal an
+        # integrity failure so the caller's except clause rolls the whole
+        # transaction back (layout change + audit row) atomically.
+        db.rollback()
+        raise UploadError(
+            500,
+            "audit_write_failed",
+            "failed to persist the archive audit record; transaction rolled back",
+        )
+    return row
+
+
 def _verify_and_finalize(db: Session, session: UploadSession) -> None:
     """Recompute the whole-package hash once every byte has arrived."""
     total = session.total_bytes
@@ -249,6 +320,16 @@ def _verify_and_finalize(db: Session, session: UploadSession) -> None:
         session.confirmed_offset = total
         session.computed_sha256 = computed
         session.failure_reason = None
+        # First audit snapshot, in the same transaction as the sealing PUT.
+        # The digest above was just recomputed from persisted bytes: reuse it
+        # instead of reading the chunks a second time.
+        _add_audit(
+            db,
+            session,
+            AUDIT_SEALED,
+            total_bytes=total,
+            whole_sha256=computed,
+        )
         return
 
     session.status = FAILED
@@ -411,6 +492,43 @@ def sealed_payload(db: Session, session: UploadSession) -> bytes:
 
 
 # --------------------------------------------------------------------------- #
+# Archive audit trail
+# --------------------------------------------------------------------------- #
+def get_audit_trail(db: Session, session_id: str) -> list[dict]:
+    """Return a session's audit snapshots ordered by event sequence.
+
+    Read-only: it neither changes the session lifecycle nor writes anything.
+    Unknown sessions raise the same ``session_not_found`` error every other
+    route uses; active/failed sessions and sessions sealed before the audit
+    feature existed simply have an empty trail.
+    """
+    session = db.get(UploadSession, session_id)
+    if session is None:
+        raise UploadError(
+            404, "session_not_found", f"unknown session id: {session_id}"
+        )
+    rows = db.execute(
+        select(AuditEvent)
+        .where(AuditEvent.session_id == session_id)
+        .order_by(AuditEvent.sequence)
+    ).scalars().all()
+    return [_audit_to_dict(row) for row in rows]
+
+
+def _audit_to_dict(row: AuditEvent) -> dict:
+    return {
+        "sequence": row.sequence,
+        "event": row.event,
+        "occurred_at": row.occurred_at,
+        "total_bytes": row.total_bytes,
+        "whole_sha256": row.whole_sha256,
+        "target_chunk_bytes": row.target_chunk_bytes,
+        "chunks_before": row.chunks_before,
+        "chunks_after": row.chunks_after,
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Sealed archive compaction
 # --------------------------------------------------------------------------- #
 def _planned_spans(total: int, target_chunk_bytes: int) -> list[tuple[int, int]]:
@@ -542,7 +660,19 @@ def compact_sealed(
             for off, end in plan
         ]
         if old_layout == new_layout:
-            # Nothing to rewrite: end the locked read transaction cleanly.
+            # Nothing to rewrite: still record that the layout was verified
+            # against this target (a successful compaction), then end the
+            # locked transaction cleanly.
+            _add_audit(
+                db,
+                session,
+                AUDIT_COMPACTED,
+                total_bytes=total,
+                whole_sha256=whole_digest,
+                target_chunk_bytes=target_chunk_bytes,
+                chunks_before=chunks_before,
+                chunks_after=len(new_layout),
+            )
             db.commit()
             return _compact_result(
                 session, target_chunk_bytes, chunks_before, len(new_layout),
@@ -629,6 +759,19 @@ def compact_sealed(
                 digest=session.whole_sha256,
                 expected_digest=recomputed_whole,
             )
+
+        # All statistics come from the verification just performed; no chunk
+        # bytes are re-read to build the snapshot.
+        _add_audit(
+            db,
+            session,
+            AUDIT_COMPACTED,
+            total_bytes=total,
+            whole_sha256=recomputed_whole,
+            target_chunk_bytes=target_chunk_bytes,
+            chunks_before=chunks_before,
+            chunks_after=len(verify_chunks),
+        )
 
         db.commit()
         return _compact_result(

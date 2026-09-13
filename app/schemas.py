@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel, Field, StrictInt, field_validator
@@ -87,3 +88,23 @@ class CompactResponse(BaseModel):
     total_bytes_after: int
     whole_sha256: str
     chunks: list[ChunkInfo]
+
+
+class AuditEventResponse(BaseModel):
+    """One archive-trail snapshot, ordered by ``sequence``."""
+
+    sequence: int
+    event: Literal["sealed", "compacted"]
+    occurred_at: datetime
+    total_bytes: int
+    whole_sha256: str
+    # Only a "compacted" snapshot carries layout statistics; a sealed
+    # snapshot leaves them null.
+    target_chunk_bytes: int | None = None
+    chunks_before: int | None = None
+    chunks_after: int | None = None
+
+
+class AuditTrailResponse(BaseModel):
+    id: str
+    events: list[AuditEventResponse]

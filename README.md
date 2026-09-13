@@ -13,6 +13,9 @@
 - 仅当 `confirmed_offset == total_bytes` **且** 由持久化字节重算的整包 SHA-256 与登记值
   相符才封存（`sealed`，不可变）；
 - 整包摘要不符 → 会话进入**不可续传的失败终态**（`failed`），必须用正确元数据新建会话；
+- 封存校验与每次成功压实都在**同一事务**内追加一条不可变的归档审计快照（会话标识、事件
+  顺序、发生时间、整包长度与摘要；压实快照另含目标块大小与前后分块数），可通过只读轨迹
+  接口按事件顺序回溯一次布局调整对应哪份已校验内容；
 - 所有错误都定位到**偏移或摘要**；最终只能观察到摘要与长度一致的封存记录。
 
 技术栈：Python 3.12 · FastAPI · SQLAlchemy 2.0 · PostgreSQL 16 · Docker Compose · pytest。
@@ -114,13 +117,43 @@ SHA-256，任一不符则完整回滚。整包身份（`id`、总字节数、整
 压实仅改变分块边界：分块数与总字节数的前后值及新布局随响应返回。
 
 - 同一目标重复压实是确定性、幂等的：得到相同布局与块摘要（已是目标布局时
-  不写任何行，`chunks_before == chunks_after`）；
+  不写任何行，`chunks_before == chunks_after`）；但每次**成功**压实（含幂等
+  空操作）都会在审计轨迹追加一条快照；
 - 仅 `sealed` 会话可压实；`active`/`failed` 返回
   `409 compaction_state_conflict`（`location.expected_offset` 与
   `details.status` 定位会话状态），且无任何副作用；
 - `target_chunk_bytes` 非正整数 / 非整数返回 `422 validation_error`；
 - 压实期间其他查询只能看到压实前或压实后的完整布局（单事务提交）；
 - 创建、上传、分块查询与内容下载契约保持兼容。
+
+### 5. 归档审计轨迹
+
+```
+GET /sessions/{id}/audit
+→ 200 {"id", "events": [{"sequence", "event", "occurred_at",
+       "total_bytes", "whole_sha256",
+       "target_chunk_bytes", "chunks_before", "chunks_after"}, ...]}
+```
+
+只读接口，按 `sequence` 升序返回快照，不改变上传会话的生命周期：
+
+- 封存校验成功时，在封存 PUT 的**同一事务**写入唯一首条记录
+  （`sequence=1`、`event="sealed"`，含会话标识、整包长度与已校验摘要；
+  0 字节包创建即封存时同样写入）；
+- 每次压实成功追加一条 `event="compacted"` 记录，复用本次压实的核验摘要
+  与统计：`target_chunk_bytes`、`chunks_before`/`chunks_after`、整包长度与
+  摘要（不重新读取或改写 Chunk 内容）；
+- `sealed` 记录的三个压实字段为 `null`；
+- 未知会话返回与其他接口一致的 `404 session_not_found`；
+- `active`/`failed` 会话、以及升级前已封存（没有审计行）的旧会话返回
+  `{"events": []}`；旧会话之后再压实会从 `sequence=1` 开始追加
+  `compacted` 记录（封存快照不回填）；
+- 封存失败不产生任何记录；压实任一步校验失败或审计写入失败时整个事务回滚，
+  布局与审计行同生共灭，不留下孤立记录。
+
+审计记录保存在新表 `audit_events`（依附 `upload_sessions`，外键
+`ON DELETE CASCADE`，`(session_id, sequence)` 唯一），随会话一并持久化，
+API 重启后可查询；新库由 `create_all` 建表，旧库启动时自动补建。
 
 ## 示例（curl）
 
@@ -145,6 +178,10 @@ dd if=pkg.bin bs=4096 count=1 2>/dev/null | curl -s -X PUT --data-binary @- \
   computed_sha256, failure_reason, created_at, updated_at)`；
 - `chunks(session_id, start_offset, end_offset, length, sha256, data bytea)`，
   `(session_id, start_offset)` 唯一约束；
+- `audit_events(session_id, sequence, event, occurred_at, total_bytes,
+  whole_sha256, target_chunk_bytes, chunks_before, chunks_after)`，
+  `(session_id, sequence)` 唯一约束，外键随会话级联删除；封存/压实审计行与
+  对应状态变更在同一个事务内提交或回滚；
 - 每个分块 PUT 在事务内对会话行 `SELECT ... FOR UPDATE` 加锁，同会话并发写入按序
   提交；败者收到带期望偏移的 `409` 后按协议重试即可；
 - 封存时按偏移顺序流式喂给 hasher 重算整包摘要（不在内存里拼装整包）。

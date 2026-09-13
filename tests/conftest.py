@@ -122,6 +122,11 @@ class Client:
             timeout=60,
         )
 
+    def audit(self, session_id: str) -> requests.Response:
+        return requests.get(
+            f"{self.base}/sessions/{session_id}/audit", timeout=10
+        )
+
 
 @pytest.fixture
 def client() -> Client:
