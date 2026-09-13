@@ -108,7 +108,10 @@ Content-Type: application/octet-stream
   `X-Whole-SHA256`。每次读取都按偏移重查全部分块的连续性、块长度与块摘要并
   重算整包摘要，确认归档完整后才交付片段，因此压实前后的不同分块边界对同一
   区间返回完全一致；格式错误或多区间 → `400 invalid_range`（`details.range`
-  回带原请求头）；超出包长或零字节包的任意区间 → `416 range_not_satisfiable`
+  回带原请求头）：范围头须严格符合 `bytes=a-b` 语法——单位、`=`、`-` 与
+  边界两侧不得夹带空白，边界仅接受 ASCII 数字（上标等 Unicode 数字同样按
+  格式错误拒绝），同一请求携带多个 `Range` 头视同多区间请求一并拒绝；
+  超出包长或零字节包的任意区间 → `416 range_not_satisfiable`
   并携带 `Content-Range: bytes */<total_bytes>`；区间读取不产生审计记录或数据
   写入；未带 `Range` 时仍以 `200` 返回完整字节与原响应头。
 

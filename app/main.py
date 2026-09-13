@@ -298,6 +298,10 @@ def _parse_single_range(range_value: str, total: int) -> tuple[int, int]:
     multi-range headers raise a 400 that cites the offending Range; ranges
     outside the package — and any range on a zero-byte package — raise 416
     carrying ``Content-Range: bytes */<total>``.
+
+    The grammar is strict RFC 9110: no whitespace around the unit, the
+    ``=``, the dash or the boundaries, and boundaries are ASCII digits
+    only — Unicode look-alikes are rejected as format errors.
     """
     def invalid(message: str) -> UploadError:
         return UploadError(
@@ -305,11 +309,10 @@ def _parse_single_range(range_value: str, total: int) -> tuple[int, int]:
         )
 
     unit, sep, spec = range_value.partition("=")
-    if not sep or unit.strip().lower() != "bytes":
+    if not sep or unit.lower() != "bytes":
         raise invalid(
             f"Range header {range_value!r} must use the 'bytes' unit"
         )
-    spec = spec.strip()
     if "," in spec:
         raise invalid(
             "multi-range requests are not supported: send a single byte range"
@@ -317,12 +320,14 @@ def _parse_single_range(range_value: str, total: int) -> tuple[int, int]:
     if spec.count("-") != 1:
         raise invalid(f"malformed byte range {range_value!r}")
     first, _, last = spec.partition("-")
-    first, last = first.strip(), last.strip()
     if not first and not last:
         raise invalid(f"empty byte range {range_value!r}")
-    if first and not first.isdigit():
+    # ASCII digits only: str.isdigit() alone also accepts Unicode look-alikes
+    # (¹, ², ³, …) which survive the HTTP layer via latin-1 but then crash
+    # int() with an unhandled ValueError.
+    if first and not (first.isascii() and first.isdigit()):
         raise invalid(f"range start {first!r} is not a non-negative integer")
-    if last and not last.isdigit():
+    if last and not (last.isascii() and last.isdigit()):
         raise invalid(f"range end {last!r} is not a non-negative integer")
 
     if not first:
@@ -366,7 +371,18 @@ def download_content(
         "ETag": f'"{session.whole_sha256}"',
         "X-Whole-SHA256": session.whole_sha256,
     }
-    range_value = request.headers.get("range")
+    # Two Range headers on one request are a multi-range request: reject it
+    # exactly like a comma-joined range set instead of silently serving only
+    # the first interval.
+    range_values = request.headers.getlist("range")
+    if len(range_values) > 1:
+        raise UploadError(
+            400,
+            "invalid_range",
+            "multi-range requests are not supported: send a single byte range",
+            details={"range": range_values},
+        )
+    range_value = range_values[0] if range_values else None
     if range_value is None:
         data = service.verified_sealed_bytes(db, session, 0, session.total_bytes)
         return Response(

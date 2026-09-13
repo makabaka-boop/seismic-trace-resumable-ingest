@@ -8,10 +8,12 @@ when a docker socket is exposed, restart the real API container.
 from __future__ import annotations
 
 import hashlib
+import http.client
 import os
 import subprocess
 import time
 import uuid
+from urllib.parse import urlsplit
 
 import psycopg
 import pytest
@@ -117,6 +119,31 @@ class Client:
             headers=headers,
             timeout=30,
         )
+
+    def content_raw_ranges(
+        self, session_id: str, range_values: list[str]
+    ) -> tuple[int, dict[str, str], bytes]:
+        """GET /content with each Range value sent as its own header line.
+
+        ``requests`` collapses duplicate header names into one, so a raw
+        http.client connection is used to put several independent Range
+        headers on the wire.  Returns (status, headers, body).
+        """
+        parts = urlsplit(self.base)
+        conn = http.client.HTTPConnection(
+            parts.hostname, parts.port, timeout=30
+        )
+        try:
+            conn.putrequest("GET", f"/sessions/{session_id}/content")
+            for value in range_values:
+                conn.putheader("Range", value)
+            conn.endheaders()
+            resp = conn.getresponse()
+            body = resp.read()
+            headers = {k.lower(): v for k, v in resp.getheaders()}
+            return resp.status, headers, body
+        finally:
+            conn.close()
 
     def compact(
         self, session_id: str, target_chunk_bytes: int | str

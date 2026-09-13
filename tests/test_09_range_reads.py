@@ -13,13 +13,17 @@ whole package:
   and the whole-package digest before releasing the fragment, so different
   chunk layouts (e.g. before/after compaction) answer the same range
   byte-identically;
-* malformed or multi-range headers get a 400 locating the Range; ranges
-  beyond the package — and any range on a zero-byte package — get 416 with
+* malformed or multi-range headers get a 400 locating the Range — this
+  covers whitespace inside the unit or boundaries, two independent Range
+  headers on one request, and non-ASCII digits such as superscripts (which
+  must never crash into an unhandled 500); ranges beyond the package — and
+  any range on a zero-byte package — get 416 with
   ``Content-Range: bytes */<total>``; no read writes data or audit rows;
 * requests without a Range header keep the original 200 full-download
   contract, and active/failed sessions keep their 409 state conflict.
 """
 import hashlib
+import json
 
 from conftest import sha, unique_payload
 
@@ -172,6 +176,66 @@ def test_malformed_and_multi_range_headers_return_400(client):
         "bytes=0-10,",
     ]
     for bad in bad_headers:
+        r = client.content(sid, bad)
+        assert r.status_code == 400, (bad, r.status_code, r.text)
+        err = r.json()["error"]
+        assert err["code"] == "invalid_range"
+        assert err["details"]["range"] == bad
+
+
+# --------------------------------------------------------------------------- #
+# Abnormal headers: embedded whitespace, duplicate headers, Unicode digits
+# --------------------------------------------------------------------------- #
+def test_range_headers_with_embedded_whitespace_are_rejected(client):
+    data = unique_payload(1000, seed=70)
+    sid = _upload_sealed(client, data, 256)
+
+    bad_headers = [
+        "bytes =0-100",     # whitespace next to the unit
+        "bytes= 0-100",     # whitespace before the first boundary
+        "bytes=0 -100",     # whitespace before the dash
+        "bytes=0- 100",     # whitespace after the dash
+        "bytes=0-100 x",    # junk after the end boundary
+        "bytes=0\t-100",    # a tab is whitespace too
+        "bytes = 0 - 100",  # whitespace everywhere
+        "bytes= -100",      # whitespace before a suffix bound
+    ]
+    for bad in bad_headers:
+        r = client.content(sid, bad)
+        assert r.status_code == 400, (bad, r.status_code, r.text)
+        err = r.json()["error"]
+        assert err["code"] == "invalid_range"
+        assert err["details"]["range"] == bad
+
+
+def test_two_range_headers_are_rejected_as_multi_range(client):
+    data = unique_payload(1000, seed=71)
+    sid = _upload_sealed(client, data, 256)
+
+    # Two independent Range headers on one request are a multi-range
+    # request: reject it instead of silently serving the first interval.
+    status, _, body = client.content_raw_ranges(
+        sid, ["bytes=0-10", "bytes=20-30"]
+    )
+    assert status == 400, body
+    err = json.loads(body)["error"]
+    assert err["code"] == "invalid_range"
+    assert err["details"]["range"] == ["bytes=0-10", "bytes=20-30"]
+
+    # A single Range header still serves exactly its interval.
+    status, headers, body = client.content_raw_ranges(sid, ["bytes=0-10"])
+    assert status == 206, body
+    assert body == data[0:11]
+    assert headers["content-range"] == "bytes 0-10/1000"
+
+
+def test_non_ascii_digit_boundaries_are_rejected_not_crashing(client):
+    data = unique_payload(1000, seed=72)
+    sid = _upload_sealed(client, data, 256)
+
+    # ¹ ² ³ are latin-1 encodable, so they reach the app intact; isdigit()
+    # accepts them but int() rejects them — this used to be a 500.
+    for bad in ("bytes=¹-³", "bytes=¹²-³⁴", "bytes=0-¹", "bytes=²-"):
         r = client.content(sid, bad)
         assert r.status_code == 400, (bad, r.status_code, r.text)
         err = r.json()["error"]
