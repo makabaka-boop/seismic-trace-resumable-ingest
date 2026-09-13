@@ -28,10 +28,14 @@ from .models import (
     ACTIVE,
     AUDIT_COMPACTED,
     AUDIT_SEALED,
+    COMPARE_CONTENT_DIFFERS,
+    COMPARE_IDENTICAL,
+    COMPARE_LENGTH_DIFFERS,
     FAILED,
     SEALED,
     AuditEvent,
     Chunk,
+    Comparison,
     UploadSession,
 )
 
@@ -903,3 +907,212 @@ def _compact_result(
             for off, end, length, digest in layout
         ],
     }
+
+
+# --------------------------------------------------------------------------- #
+# Sealed archive comparison
+# --------------------------------------------------------------------------- #
+def _verified_archive_chunks(
+    db: Session, session: UploadSession, side: str
+) -> list[Chunk]:
+    """Re-verify one sealed archive and return its chunks in offset order.
+
+    Same checks as the download path — chunk continuity, declared-vs-stored
+    lengths, per-chunk SHA-256 and the whole-package digest — but reported
+    under the comparison error code and tagged with the side (baseline or
+    candidate) whose archive failed, so the engineer knows which package to
+    re-upload.  Raises before any comparison row is written.
+    """
+    chunks = list(
+        db.execute(
+            select(Chunk)
+            .where(Chunk.session_id == session.id)
+            .order_by(Chunk.start_offset)
+        ).scalars().all()
+    )
+    hasher = hashlib.sha256()
+    cursor = 0
+    for chunk in chunks:
+        if chunk.start_offset != cursor:
+            raise UploadError(
+                500,
+                "comparison_integrity_error",
+                f"{side} archive chunks are discontinuous at offset {cursor}",
+                expected_offset=cursor,
+                details={"side": side, "session_id": session.id},
+            )
+        if (
+            chunk.length != chunk.end_offset - chunk.start_offset
+            or len(chunk.data) != chunk.length
+        ):
+            raise UploadError(
+                500,
+                "comparison_integrity_error",
+                (
+                    f"{side} archive chunk at offset {chunk.start_offset} "
+                    "has inconsistent length metadata"
+                ),
+                offset=chunk.start_offset,
+                details={"side": side, "session_id": session.id},
+            )
+        if hashlib.sha256(chunk.data).hexdigest() != chunk.sha256:
+            raise UploadError(
+                500,
+                "comparison_integrity_error",
+                (
+                    f"{side} archive chunk at offset {chunk.start_offset} "
+                    "fails its own SHA-256 check"
+                ),
+                offset=chunk.start_offset,
+                expected_digest=chunk.sha256,
+                details={"side": side, "session_id": session.id},
+            )
+        hasher.update(chunk.data)
+        cursor = chunk.end_offset
+
+    if cursor != session.total_bytes:
+        raise UploadError(
+            500,
+            "comparison_integrity_error",
+            (
+                f"{side} archived length {cursor} does not match registered "
+                f"total_bytes {session.total_bytes}"
+            ),
+            offset=cursor,
+            expected_offset=session.total_bytes,
+            details={"side": side, "session_id": session.id},
+        )
+    if hasher.hexdigest() != session.whole_sha256:
+        raise UploadError(
+            500,
+            "comparison_integrity_error",
+            f"{side} archive fails whole digest verification",
+            expected_digest=session.whole_sha256,
+            details={"side": side, "session_id": session.id},
+        )
+    return chunks
+
+
+def _streams_first_difference(
+    left: list[bytes], right: list[bytes]
+) -> tuple[int, int | None]:
+    """Walk two byte streams in offset order.
+
+    Returns ``(common_prefix_bytes, first_difference_offset)``.  The offset
+    is ``None`` when both streams are byte-identical over their full length;
+    otherwise it is the first offset whose byte differs, or the offset at
+    which the shorter stream ends.
+    """
+    offset = 0
+    li = ri = 0
+    lp = rp = 0  # consumed positions inside the current block of each side
+    while li < len(left) and ri < len(right):
+        lseg = memoryview(left[li])[lp:]
+        rseg = memoryview(right[ri])[rp:]
+        n = min(len(lseg), len(rseg))
+        if lseg[:n] != rseg[:n]:
+            for i in range(n):
+                if lseg[i] != rseg[i]:
+                    return offset + i, offset + i
+        offset += n
+        lp += n
+        rp += n
+        if lp == len(left[li]):
+            li += 1
+            lp = 0
+        if rp == len(right[ri]):
+            ri += 1
+            rp = 0
+    if li == len(left) and ri == len(right):
+        return offset, None
+    return offset, offset
+
+
+def create_comparison(
+    db: Session, baseline_session_id: str, candidate_session_id: str
+) -> Comparison:
+    """Compare two sealed archives and persist the immutable result.
+
+    Both sessions must exist and be sealed; both archives are re-verified
+    (continuity, chunk digests, whole digests) before their bytes are walked
+    in offset order.  The record stores its own per-side length/digest
+    snapshot, so later compaction of either archive cannot change it.  Any
+    verification failure raises before the row exists — a failed comparison
+    never leaves a record behind.
+    """
+    baseline = db.get(UploadSession, baseline_session_id)
+    if baseline is None:
+        raise UploadError(
+            404, "session_not_found", f"unknown session id: {baseline_session_id}"
+        )
+    candidate = db.get(UploadSession, candidate_session_id)
+    if candidate is None:
+        raise UploadError(
+            404, "session_not_found", f"unknown session id: {candidate_session_id}"
+        )
+
+    for side, session in (("baseline", baseline), ("candidate", candidate)):
+        if session.status != SEALED:
+            raise UploadError(
+                409,
+                "comparison_state_conflict",
+                (
+                    f"{side} session {session.id} is not sealed "
+                    f"(state={session.status}); both archives must be sealed "
+                    "before they can be compared"
+                ),
+                expected_offset=session.confirmed_offset,
+                details={
+                    "side": side,
+                    "session_id": session.id,
+                    "status": session.status,
+                },
+            )
+
+    # Pass 1: verify both archives fully (continuity, chunk and whole
+    # digests).  Pass 2: stream-compare by offset.  Verification always
+    # completes first, so a corrupt archive fails before any comparison row.
+    baseline_chunks = _verified_archive_chunks(db, baseline, "baseline")
+    candidate_chunks = _verified_archive_chunks(db, candidate, "candidate")
+
+    common_prefix, first_difference = _streams_first_difference(
+        [c.data for c in baseline_chunks],
+        [c.data for c in candidate_chunks],
+    )
+
+    if first_difference is None:
+        conclusion = COMPARE_IDENTICAL
+    elif first_difference == min(baseline.total_bytes, candidate.total_bytes):
+        # The shared span is identical but one archive ends there.
+        conclusion = COMPARE_LENGTH_DIFFERS
+    else:
+        conclusion = COMPARE_CONTENT_DIFFERS
+
+    record = Comparison(
+        id=str(uuid.uuid4()),
+        baseline_session_id=baseline.id,
+        candidate_session_id=candidate.id,
+        baseline_total_bytes=baseline.total_bytes,
+        baseline_whole_sha256=baseline.whole_sha256,
+        candidate_total_bytes=candidate.total_bytes,
+        candidate_whole_sha256=candidate.whole_sha256,
+        common_prefix_bytes=common_prefix,
+        first_difference_offset=first_difference,
+        conclusion=conclusion,
+    )
+    db.add(record)
+    db.commit()
+    db.refresh(record)
+    return record
+
+
+def get_comparison(db: Session, comparison_id: str) -> Comparison:
+    """Re-fetch a persisted comparison record by its identifier."""
+    record = db.get(Comparison, comparison_id)
+    if record is None:
+        raise UploadError(
+            404,
+            "comparison_not_found",
+            f"unknown comparison id: {comparison_id}",
+        )
+    return record

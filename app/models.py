@@ -31,6 +31,11 @@ FAILED = "failed"    # whole hash mismatch; terminal, cannot be resumed
 AUDIT_SEALED = "sealed"        # first snapshot: verification succeeded
 AUDIT_COMPACTED = "compacted"  # a successful layout rewrite (incl. no-op)
 
+# Comparison conclusions -------------------------------------------------------
+COMPARE_IDENTICAL = "identical"              # same length, same bytes
+COMPARE_CONTENT_DIFFERS = "content_differs"  # a byte differs inside the common span
+COMPARE_LENGTH_DIFFERS = "length_differs"    # common span equal, lengths differ
+
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -138,3 +143,52 @@ class AuditEvent(Base):
     chunks_after: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
     session: Mapped[UploadSession] = relationship(back_populates="audit_events")
+
+
+class Comparison(Base):
+    """One immutable comparison record between two sealed archives.
+
+    Written once, inside the same transaction that re-verified both archives
+    (chunk continuity, per-chunk digests, whole-package digests) and walked
+    both byte streams to their first difference.  The row carries its own
+    snapshot of both sides' length and whole digest, so later compaction of
+    either archive — or an API restart — can never change what was recorded.
+    """
+
+    __tablename__ = "comparisons"
+    __table_args__ = (
+        Index("ix_comparison_baseline", "baseline_session_id"),
+        Index("ix_comparison_candidate", "candidate_session_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    baseline_session_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("upload_sessions.id"),
+        nullable=False,
+    )
+    candidate_session_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("upload_sessions.id"),
+        nullable=False,
+    )
+
+    # Per-side snapshots taken at comparison time.
+    baseline_total_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    baseline_whole_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    candidate_total_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    candidate_whole_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    # Result of the offset-ordered stream comparison.
+    common_prefix_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # NULL only when the two archives are byte-identical; otherwise the
+    # offset of the first differing byte (or, for a pure length difference,
+    # the offset at which the shorter archive ends).
+    first_difference_offset: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True
+    )
+    conclusion: Mapped[str] = mapped_column(String(16), nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )

@@ -159,6 +159,23 @@ class Client:
             f"{self.base}/sessions/{session_id}/audit", timeout=10
         )
 
+    def compare(
+        self, baseline_session_id: str, candidate_session_id: str
+    ) -> requests.Response:
+        return requests.post(
+            f"{self.base}/comparisons",
+            json={
+                "baseline_session_id": baseline_session_id,
+                "candidate_session_id": candidate_session_id,
+            },
+            timeout=60,
+        )
+
+    def comparison(self, comparison_id: str) -> requests.Response:
+        return requests.get(
+            f"{self.base}/comparisons/{comparison_id}", timeout=10
+        )
+
 
 @pytest.fixture
 def client() -> Client:

@@ -108,3 +108,35 @@ class AuditEventResponse(BaseModel):
 class AuditTrailResponse(BaseModel):
     id: str
     events: list[AuditEventResponse]
+
+
+class ComparisonCreate(BaseModel):
+    """Submit the two sealed sessions whose archives should be compared."""
+
+    baseline_session_id: str = Field(
+        ..., min_length=1, description="Session id of the baseline archive"
+    )
+    candidate_session_id: str = Field(
+        ..., min_length=1, description="Session id of the candidate archive"
+    )
+
+
+class ComparisonResponse(BaseModel):
+    """Immutable comparison snapshot.
+
+    ``first_difference_offset`` is null only for identical archives; for a
+    pure length difference it is the offset at which the shorter archive
+    ends (equal to ``common_prefix_bytes``).
+    """
+
+    id: str
+    baseline_session_id: str
+    candidate_session_id: str
+    baseline_total_bytes: int
+    baseline_whole_sha256: str
+    candidate_total_bytes: int
+    candidate_whole_sha256: str
+    common_prefix_bytes: int
+    first_difference_offset: int | None = None
+    conclusion: Literal["identical", "content_differs", "length_differs"]
+    created_at: datetime

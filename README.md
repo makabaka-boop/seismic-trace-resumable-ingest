@@ -19,6 +19,11 @@
 - 封存记录支持 **HTTP 单区间读取**（`Range: bytes=a-b` / `a-` / `-n`）：跨持久化分块
   提取片段前重新核验全部归档字节（连续性、块长度、块摘要、整包摘要），压实前后同一区间
   响应一致；区间读取不留下审计记录或数据写入；
+- 同一测线的两份**封存**记录可提交**比对**：服务端同步重核两份归档的分块连续性、块摘要
+  与整包摘要，再按偏移流式比较，持久化一条**不可变比对记录**（双方长度与摘要快照、相同
+  前缀长度、首个差异偏移、一致/内容不同/长度不同的结论），凭比对标识可随时重取——无需
+  下载整包即可定位首个差异字节；记录跨 API 重启保留，事后压实任一封存记录都不改变已保存
+  的快照；
 - 所有错误都定位到**偏移或摘要**；最终只能观察到摘要与长度一致的封存记录。
 
 技术栈：Python 3.12 · FastAPI · SQLAlchemy 2.0 · PostgreSQL 16 · Docker Compose · pytest。
@@ -170,6 +175,45 @@ GET /sessions/{id}/audit
 `ON DELETE CASCADE`，`(session_id, sequence)` 唯一），随会话一并持久化，
 API 重启后可查询；新库由 `create_all` 建表，旧库启动时自动补建。
 
+### 6. 封存记录比对
+
+```
+POST /comparisons
+{"baseline_session_id": "<基准会话>", "candidate_session_id": "<候选会话>"}
+→ 201 {"id", "baseline_session_id", "candidate_session_id",
+       "baseline_total_bytes", "baseline_whole_sha256",
+       "candidate_total_bytes", "candidate_whole_sha256",
+       "common_prefix_bytes", "first_difference_offset",
+       "conclusion", "created_at"}
+
+GET /comparisons/{id}
+→ 200 同上结构
+```
+
+交付同一测线的两份封存记录包前，无需下载整包即可定位内容是否一致及首个差异字节。
+创建时服务端**同步**完成：先分别重核两份归档的分块连续性、块长度、块摘要与整包摘要，
+再按偏移流式比较两侧字节，随后在同一提交内持久化一条**不可变比对记录**并返回完整结果：
+
+- `conclusion` 为 `identical`（长度与字节完全一致）、`content_differs`（公共范围内
+  存在不同字节）或 `length_differs`（公共前缀完全相同但长度不同）；
+- `common_prefix_bytes` 是两侧逐字节相同的前缀长度；`first_difference_offset` 是首个
+  差异字节的偏移——仅 `identical` 时为 `null`，纯长度差异时等于较短包的长度（即
+  `common_prefix_bytes`）；
+- 记录自带双方 `total_bytes` 与 `whole_sha256` 快照：事后再压实任一封存记录、或 API
+  进程重启，凭 `id` 重取的结果都保持不变；对同一对会话再次比对会生成新记录而不改动
+  旧记录；
+- 只有两端均为 `sealed` 才执行：未知会话按现有 `404 session_not_found` 反馈；
+  `active`/`failed` 会话返回 `409 comparison_state_conflict`，`details.side`
+  （`baseline`/`candidate`）、`details.session_id` 与 `details.status` 指明哪一端
+  及其状态，且不写入任何记录；
+- 归档校验异常返回 `500 comparison_integrity_error`（`details.side` 指明失败端），
+  同样不留下比对记录；未知比对标识返回 `404 comparison_not_found`；
+- 比对不触碰上传会话生命周期：不产生审计记录、不改变分块布局，上传、封存、压实、
+  审计与下载契约保持兼容。
+
+比对记录保存在新表 `comparisons`（外键依附 `upload_sessions`），随库持久化；新库由
+`create_all` 建表，旧库启动时自动补建。
+
 ## 示例（curl）
 
 ```bash
@@ -197,6 +241,11 @@ dd if=pkg.bin bs=4096 count=1 2>/dev/null | curl -s -X PUT --data-binary @- \
   whole_sha256, target_chunk_bytes, chunks_before, chunks_after)`，
   `(session_id, sequence)` 唯一约束，外键随会话级联删除；封存/压实审计行与
   对应状态变更在同一个事务内提交或回滚；
+- `comparisons(id, baseline_session_id, candidate_session_id,
+  baseline_total_bytes, baseline_whole_sha256, candidate_total_bytes,
+  candidate_whole_sha256, common_prefix_bytes, first_difference_offset,
+  conclusion, created_at)`，外键依附 `upload_sessions`；记录一经提交不再修改，
+  压实与重启都不改变已保存的快照；
 - 每个分块 PUT 在事务内对会话行 `SELECT ... FOR UPDATE` 加锁，同会话并发写入按序
   提交；败者收到带期望偏移的 `409` 后按协议重试即可；
 - 封存时按偏移顺序流式喂给 hasher 重算整包摘要（不在内存里拼装整包）。

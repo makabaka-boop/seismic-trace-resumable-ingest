@@ -16,12 +16,14 @@ from . import service
 from .config import MAX_CHUNK_BYTES
 from .database import get_db, init_db
 from .errors import UploadError
-from .models import SEALED, Chunk, UploadSession
+from .models import SEALED, Chunk, Comparison, UploadSession
 from .schemas import (
     AuditTrailResponse,
     ChunkAck,
     CompactRequest,
     CompactResponse,
+    ComparisonCreate,
+    ComparisonResponse,
     SessionCreate,
     SessionResponse,
 )
@@ -403,6 +405,52 @@ def download_content(
             "Content-Length": str(len(data)),
         },
     )
+
+
+# --------------------------------------------------------------------------- #
+# Sealed archive comparison — immutable records
+# --------------------------------------------------------------------------- #
+def _comparison_to_response(record: Comparison) -> ComparisonResponse:
+    return ComparisonResponse(
+        id=record.id,
+        baseline_session_id=record.baseline_session_id,
+        candidate_session_id=record.candidate_session_id,
+        baseline_total_bytes=record.baseline_total_bytes,
+        baseline_whole_sha256=record.baseline_whole_sha256,
+        candidate_total_bytes=record.candidate_total_bytes,
+        candidate_whole_sha256=record.candidate_whole_sha256,
+        common_prefix_bytes=record.common_prefix_bytes,
+        first_difference_offset=record.first_difference_offset,
+        conclusion=record.conclusion,
+        created_at=record.created_at,
+    )
+
+
+@app.post("/comparisons", response_model=ComparisonResponse, status_code=201)
+def create_comparison(
+    payload: ComparisonCreate, db: Session = Depends(get_db)
+) -> ComparisonResponse:
+    """Compare two sealed archives without downloading either package.
+
+    Both archives are re-verified (chunk continuity, per-chunk digests,
+    whole-package digests) and then walked in offset order; the persisted
+    record snapshots both sides' length and whole digest, the common prefix
+    length, the first differing offset and the conclusion.
+    """
+    record = service.create_comparison(
+        db,
+        baseline_session_id=payload.baseline_session_id,
+        candidate_session_id=payload.candidate_session_id,
+    )
+    return _comparison_to_response(record)
+
+
+@app.get("/comparisons/{comparison_id}", response_model=ComparisonResponse)
+def get_comparison(
+    comparison_id: str, db: Session = Depends(get_db)
+) -> ComparisonResponse:
+    """Re-fetch the immutable comparison record by its identifier."""
+    return _comparison_to_response(service.get_comparison(db, comparison_id))
 
 
 # --------------------------------------------------------------------------- #
