@@ -486,9 +486,93 @@ def put_chunk(
     raise _stale_offset_error(session, start)
 
 
-def sealed_payload(db: Session, session: UploadSession) -> bytes:
-    """Materialise the archived package; only used for the download route."""
-    return _archived_bytes(db, session.id, 0, session.total_bytes) or b""
+# --------------------------------------------------------------------------- #
+# Sealed archive retrieval (full package or a single byte range)
+# --------------------------------------------------------------------------- #
+def verified_sealed_bytes(
+    db: Session, session: UploadSession, begin: int, end: int
+) -> bytes:
+    """Return archived bytes for the half-open span [begin, end).
+
+    Every persisted chunk is walked in offset order and checked for
+    continuity, declared-vs-stored length and its own SHA-256, and the
+    whole-package digest is recomputed: the requested span is only released
+    once the *entire* archive verifies, so a corrupt block fails the read
+    with a 500 integrity error even when it lies outside the requested
+    window.  Chunk boundaries are irrelevant to the result — compacting the
+    archive before or after does not change what a given range returns.
+    """
+    chunks = list(
+        db.execute(
+            select(Chunk)
+            .where(Chunk.session_id == session.id)
+            .order_by(Chunk.start_offset)
+        ).scalars().all()
+    )
+    hasher = hashlib.sha256()
+    cursor = 0
+    out = bytearray()
+    for chunk in chunks:
+        if chunk.start_offset != cursor:
+            raise UploadError(
+                500,
+                "sealed_integrity_error",
+                f"stored chunks are discontinuous at offset {cursor}",
+                expected_offset=cursor,
+            )
+        if (
+            chunk.length != chunk.end_offset - chunk.start_offset
+            or len(chunk.data) != chunk.length
+        ):
+            raise UploadError(
+                500,
+                "sealed_integrity_error",
+                (
+                    f"chunk at offset {chunk.start_offset} has inconsistent "
+                    "length metadata"
+                ),
+                offset=chunk.start_offset,
+            )
+        if hashlib.sha256(chunk.data).hexdigest() != chunk.sha256:
+            raise UploadError(
+                500,
+                "sealed_integrity_error",
+                (
+                    f"chunk at offset {chunk.start_offset} fails its own "
+                    "SHA-256 check"
+                ),
+                offset=chunk.start_offset,
+                expected_digest=chunk.sha256,
+            )
+        hasher.update(chunk.data)
+        if chunk.start_offset < end and chunk.end_offset > begin:
+            out.extend(
+                chunk.data[
+                    max(begin, chunk.start_offset) - chunk.start_offset:
+                    min(end, chunk.end_offset) - chunk.start_offset
+                ]
+            )
+        cursor = chunk.end_offset
+
+    if cursor != session.total_bytes:
+        raise UploadError(
+            500,
+            "sealed_integrity_error",
+            (
+                f"archived length {cursor} does not match registered "
+                f"total_bytes {session.total_bytes}"
+            ),
+            offset=cursor,
+            expected_offset=session.total_bytes,
+        )
+    if hasher.hexdigest() != session.whole_sha256:
+        raise UploadError(
+            500,
+            "sealed_integrity_error",
+            "stored sealed content fails whole digest verification",
+            expected_digest=session.whole_sha256,
+        )
+    return bytes(out)
 
 
 # --------------------------------------------------------------------------- #

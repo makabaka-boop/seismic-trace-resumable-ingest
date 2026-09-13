@@ -1,7 +1,6 @@
 """HTTP API for resumable seismograph record uploads."""
 from __future__ import annotations
 
-import hashlib
 import re
 
 from contextlib import asynccontextmanager
@@ -52,7 +51,11 @@ app = FastAPI(
 # --------------------------------------------------------------------------- #
 @app.exception_handler(UploadError)
 async def _upload_error_handler(_: Request, exc: UploadError) -> JSONResponse:
-    return JSONResponse(status_code=exc.status_code, content=exc.to_body())
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=exc.to_body(),
+        headers=exc.headers or None,
+    )
 
 
 @app.exception_handler(RequestValidationError)
@@ -272,11 +275,75 @@ def upload_chunk(
 
 
 # --------------------------------------------------------------------------- #
-# Sealed archive retrieval
+# Sealed archive retrieval — full package or a single HTTP byte range
 # --------------------------------------------------------------------------- #
+def _unsatisfiable(range_value: str, total: int) -> UploadError:
+    """416 for ranges outside the package (or any range on a 0-byte one)."""
+    return UploadError(
+        416,
+        "range_not_satisfiable",
+        (
+            f"requested range {range_value!r} is not satisfiable for a "
+            f"sealed package of {total} bytes"
+        ),
+        details={"range": range_value, "total_bytes": total},
+        headers={"Content-Range": f"bytes */{total}"},
+    )
+
+
+def _parse_single_range(range_value: str, total: int) -> tuple[int, int]:
+    """Parse one HTTP byte-range against the sealed package length.
+
+    Returns the half-open ``[begin, end)`` span to serve.  Malformed or
+    multi-range headers raise a 400 that cites the offending Range; ranges
+    outside the package — and any range on a zero-byte package — raise 416
+    carrying ``Content-Range: bytes */<total>``.
+    """
+    def invalid(message: str) -> UploadError:
+        return UploadError(
+            400, "invalid_range", message, details={"range": range_value}
+        )
+
+    unit, sep, spec = range_value.partition("=")
+    if not sep or unit.strip().lower() != "bytes":
+        raise invalid(
+            f"Range header {range_value!r} must use the 'bytes' unit"
+        )
+    spec = spec.strip()
+    if "," in spec:
+        raise invalid(
+            "multi-range requests are not supported: send a single byte range"
+        )
+    if spec.count("-") != 1:
+        raise invalid(f"malformed byte range {range_value!r}")
+    first, _, last = spec.partition("-")
+    first, last = first.strip(), last.strip()
+    if not first and not last:
+        raise invalid(f"empty byte range {range_value!r}")
+    if first and not first.isdigit():
+        raise invalid(f"range start {first!r} is not a non-negative integer")
+    if last and not last.isdigit():
+        raise invalid(f"range end {last!r} is not a non-negative integer")
+
+    if not first:
+        # Suffix form: the last N bytes of the package.
+        suffix = int(last)
+        if suffix == 0 or total == 0:
+            raise _unsatisfiable(range_value, total)
+        return max(total - suffix, 0), total
+
+    start = int(first)
+    if last and int(last) < start:
+        raise invalid(f"range start {start} is after range end {int(last)}")
+    if start >= total:
+        raise _unsatisfiable(range_value, total)
+    end = min(int(last) + 1, total) if last else total
+    return start, end
+
+
 @app.get("/sessions/{session_id}/content")
 def download_content(
-    session_id: str, db: Session = Depends(get_db)
+    session_id: str, request: Request, db: Session = Depends(get_db)
 ) -> Response:
     session = db.get(UploadSession, session_id)
     if session is None:
@@ -290,22 +357,34 @@ def download_content(
             f"content is only retrievable for sealed sessions (state={session.status})",
             expected_offset=session.confirmed_offset,
         )
-    data = service.sealed_payload(db, session)
-    # Defensive: a sealed record must recompute to the registered digest.
-    if hashlib.sha256(data).hexdigest() != session.whole_sha256:
-        raise UploadError(
-            500,
-            "sealed_integrity_error",
-            "stored sealed content fails whole digest verification",
-            expected_digest=session.whole_sha256,
+
+    # Every read — full or partial — re-verifies the whole archive (chunk
+    # continuity, per-chunk lengths and digests, whole-package digest) before
+    # any byte is released; the layout never changes what a range returns.
+    base_headers = {
+        "Accept-Ranges": "bytes",
+        "ETag": f'"{session.whole_sha256}"',
+        "X-Whole-SHA256": session.whole_sha256,
+    }
+    range_value = request.headers.get("range")
+    if range_value is None:
+        data = service.verified_sealed_bytes(db, session, 0, session.total_bytes)
+        return Response(
+            content=data,
+            media_type="application/octet-stream",
+            headers={**base_headers, "Content-Length": str(len(data))},
         )
+
+    begin, end = _parse_single_range(range_value, session.total_bytes)
+    data = service.verified_sealed_bytes(db, session, begin, end)
     return Response(
         content=data,
+        status_code=206,
         media_type="application/octet-stream",
         headers={
+            **base_headers,
+            "Content-Range": f"bytes {begin}-{end - 1}/{session.total_bytes}",
             "Content-Length": str(len(data)),
-            "ETag": f'"{session.whole_sha256}"',
-            "X-Whole-SHA256": session.whole_sha256,
         },
     )
 

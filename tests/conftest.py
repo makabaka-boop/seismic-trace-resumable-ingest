@@ -108,9 +108,14 @@ class Client:
             f"{self.base}/sessions/{session_id}/chunks", timeout=10
         )
 
-    def content(self, session_id: str) -> requests.Response:
+    def content(
+        self, session_id: str, range_header: str | None = None
+    ) -> requests.Response:
+        headers = {"Range": range_header} if range_header is not None else {}
         return requests.get(
-            f"{self.base}/sessions/{session_id}/content", timeout=30
+            f"{self.base}/sessions/{session_id}/content",
+            headers=headers,
+            timeout=30,
         )
 
     def compact(

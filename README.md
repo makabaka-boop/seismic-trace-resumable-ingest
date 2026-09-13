@@ -16,6 +16,9 @@
 - 封存校验与每次成功压实都在**同一事务**内追加一条不可变的归档审计快照（会话标识、事件
   顺序、发生时间、整包长度与摘要；压实快照另含目标块大小与前后分块数），可通过只读轨迹
   接口按事件顺序回溯一次布局调整对应哪份已校验内容；
+- 封存记录支持 **HTTP 单区间读取**（`Range: bytes=a-b` / `a-` / `-n`）：跨持久化分块
+  提取片段前重新核验全部归档字节（连续性、块长度、块摘要、整包摘要），压实前后同一区间
+  响应一致；区间读取不留下审计记录或数据写入；
 - 所有错误都定位到**偏移或摘要**；最终只能观察到摘要与长度一致的封存记录。
 
 技术栈：Python 3.12 · FastAPI · SQLAlchemy 2.0 · PostgreSQL 16 · Docker Compose · pytest。
@@ -98,7 +101,16 @@ Content-Type: application/octet-stream
 - `GET /sessions/{id}` — 状态、`confirmed_offset`、登记/实算摘要；
 - `GET /sessions/{id}/chunks` — 已持久化的分块检查点（偏移、长度、摘要）；
 - `GET /sessions/{id}/content` — 仅 `sealed` 可下载；响应头 `ETag`/
-  `X-Whole-SHA256` 为登记摘要，且服务端出库时再次校验。
+  `X-Whole-SHA256` 为登记摘要，且服务端出库时再次校验。携带
+  `Range: bytes=a-b`（闭区间）、`bytes=a-`（开放结尾）或 `bytes=-n`（后缀长度）
+  时执行**单区间读取**：按封存包总长度解析区间，跨持久化分块提取字节，返回
+  `206` 及 `Content-Range`/`Content-Length`/`Accept-Ranges`/原 `ETag`/
+  `X-Whole-SHA256`。每次读取都按偏移重查全部分块的连续性、块长度与块摘要并
+  重算整包摘要，确认归档完整后才交付片段，因此压实前后的不同分块边界对同一
+  区间返回完全一致；格式错误或多区间 → `400 invalid_range`（`details.range`
+  回带原请求头）；超出包长或零字节包的任意区间 → `416 range_not_satisfiable`
+  并携带 `Content-Range: bytes */<total_bytes>`；区间读取不产生审计记录或数据
+  写入；未带 `Range` 时仍以 `200` 返回完整字节与原响应头。
 
 ### 4. 压实封存记录
 

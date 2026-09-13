@@ -21,6 +21,7 @@ class UploadError(Exception):
         digest: str | None = None,
         expected_digest: str | None = None,
         details: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
@@ -31,6 +32,8 @@ class UploadError(Exception):
         self.digest = digest
         self.expected_digest = expected_digest
         self.details = details or {}
+        # Extra response headers (e.g. 416 replies must carry Content-Range).
+        self.headers = headers or {}
 
     def to_body(self) -> dict[str, Any]:
         body: dict[str, Any] = {
